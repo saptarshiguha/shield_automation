@@ -1,0 +1,1027 @@
+---
+title: Automated Shield Experiment Summaries
+author: Saptarshi Guha <joy@mozilla.com>
+date: "`r format(Sys.time(), '%H:%M %B %d, %Y',tz='America/Los_Angeles',usetz=TRUE)`"
+output:
+ html_document:
+    mathjax: default
+    self_contained: false
+    theme: readable
+    highlight: haddock
+    number_sections: true
+    toc_depth: 5
+    toc: true
+    keep_md: TRUE
+---
+
+
+
+```{r child = '/home/sguha/mz/template2.Rmd'}
+```
+
+
+```{r options, echo=FALSE}
+knitr::knit_engines$set(python = reticulate::eng_python)
+```
+
+# Introduction
+
+The purpose of this document is to provide a methodology for the data engineer
+to implement automated summaries for shield experiments. Some of the discussion
+can be found 
+
+- [Core Product Metrics - engagement and  retention](https://docs.google.com/document/d/1gRZ5X_EV_mZgoTpGXN7daEmVy4pqnvgP3iJh9qKB1XE/edit)  
+- [Core Product Metrics  - performance and  stability](https://docs.google.com/document/d/1Kv2o115F2eHJotiQf1_S3H7SJOyfICXIbMifxBxg6ig/edit)
+  
+For the moment we will tackle the first one and make the following observations
+
+- the results will be provided on a daily basis but many
+  warning/banners/education will be provided to warn the audience to not draw
+  conclusions before the end of the experiment
+- we will use some sort of bootstrap to compute confidence intervals of relative
+  differences 
+- the data will be pulled from `main_summary` which holds information regarding
+  the experiment i.e.
+      - test/control
+      - experiment name
+- some experiments have extra experiment specific information contained in the
+  experiments parquet data set(see
+  [ICQ](https://metrics.mozilla.com/protected/sguha/icq_analysis.html)). However
+  for these measures we need only look at the `main_summary` data set for the
+  measures.
+
+# Things We Need To Know
+
+For every experiment, we need to know the following(parameters)
+
+
+- **the experiment identifier** (for example for the ICQ experiment it was `icqStudyV1`)
+- the **enrollment period**, that is, when (`submission_date_s3`) the experiment
+  began (this will be our minimum date filter) and when did enrollment end. We
+  will take those clients that 
+      - pinged us during the enrollment start and (end+2 days) dates (note, we
+        use `submission_date_s3`, the extra 2 days a slight buffer to
+        accommodate submission lag ).
+      - and have the experiment identifier non null
+- the different **branches and branch proportions**
+    - we use this to compute the branches we see and their actual proportion
+    allocation. By the end of the experiment this ought match the spec in the
+    experiments PHD.
+- the **observation period**: once enrolled, how long do we study the profiles
+for? This will be used to aggregate the various metrics.
+
+This will be the experiment cohort, partitioned by test and control.
+
+# Measures For this Document
+
+There are two types: performance and usage. In general, all measures are
+aggregated to the profile level and we compare the groups of profiles. In this
+document we will talk about usage measures. 
+
+For a profile, the first date in the enrollment period, is their enrollment
+date. Call this $E_i$ , the enrollment
+date for profile $i$. The first week is $[E_i,E_i+6]$, the second week
+$[E_i+7,E_i+13]$ and the third week is $[E_i+14,E_i+20]$.
+          
+## Definitions
+
+- **retention(mret)** : was the profile active in the third week? By active, they must
+  have at least one  `subsession_length` strictly greater than zero in the third
+  week.
+- **active retention(maret)** : was the profile active in the third week? By
+  active, they must have at least one *day*, in the third week, where the sum of
+  `scalar_parent_browser_engagement_total_uri_count` is greater than or equal to 5.
+
+<div style='background-color:#aaaaaa;'> 
+Because of these definitions, a study must
+be of at least 4 weeks(one week for enrollment, 3 weeks to observe) for the
+above to be computed. We can calculate the measures below for every day but not
+the two above.  
+</div>
+
+For the following, the time period for the aggregates is the entire observation
+period :
+
+- **total hours/profile/day(mth)** : per profile, average of `subsession_length` in hours
+- **active hours/profile/day(mah)** : per profile, average of `active_ticks`
+  expressed in hours
+- **uris visited/hour/profile(muri)**: per profile, sum of
+  `scalar_parent_browser_engagement_total_uri_count` divided by
+  ($\frac{1}{3600}$+sum of `active_ticks`*5/3600)
+- **intensity(mins)**: sum of  (sum of `active_ticks`*5/3600) divided ($\frac{1}{3600}$+sum of `subsession_length`/3600).
+
+If any of the above metrics are missing, they are  replaced with zero.
+
+## Sample Code: Extracting Data
+
+We will begin by converting the above specifications into code for chosen
+Shield experiment. Let's consider the ["Testing a11y
+indicator"](https://docs.google.com/document/d/1VOPe_Yu2Wx5zB4TpMX-8GU3dynQlTFR25kfQRDhopyQ/edit)
+experiment. 
+
+- **experiment identifier**: 'pref-flip-a11y-visual-indicator-1412603'
+- **enrollment period**: I don't always see this in the Phd document (not for
+  this one at least and I recall asking in the #shield Slack channel for these answers. This is
+  obviously not convenient and maybe enrollment period must be **explicitly**
+  mentioned in  the Phd document). I found this to be 2018-01-29 to 2018-02-12 (the 'go live'
+  date in the document iirc was incorrect). 
+- **branch and proportions**: there were two, of 1:1 split
+- **observation period** is for three weeks after enrollment date (again same
+  notes as in the enrollment period section above)
+
+
+<div style='background-color:#aaaaaa;'>
+In this particular example, the branches are called Disabled and Enabled. Having
+non standard branch names might pose problem for automation.
+</div>
+We extract the client ids in the experiment present during the enrollment
+window. We also take the first branch the profile was observed in (thus this
+approach does not check for branch switching and maybe this is not the time to
+even check for branch switching)
+
+
+Given this data, we need to convert it to the following form, where the dates
+now span the observation period.
+
+```
+cid,branch,enroll date, submission_date, weeksSinceEnrollment, total hours, total active hours, total uris 
+```
+
+
+
+```{pydbx ex3getAllData, cache=TRUE,dependson='ex1gatherdata',storein='t1'}
+
+data1a = spark.sql("""
+   select
+      client_id as cid,
+      date_format(from_unixtime(unix_timestamp(submission_date_s3, 'yyyyMMdd'), 'yyyy-MM-dd'), 'yyyy-MM-dd') as date,
+      first(experiments['pref-flip-a11y-visual-indicator-1412603']) as branch,
+      sum(coalesce(scalar_parent_browser_engagement_total_uri_count,0)) as muri,
+      sum(subsession_length/3600) as mtth,
+      sum(active_ticks*5/3600) as mtah
+      from main_summary
+      where submission_date_s3 >= '20180129' and submission_date_s3<= '20180304'
+      and app_name = 'Firefox'
+      and normalized_channel = 'release'
+      and experiments['pref-flip-a11y-visual-indicator-1412603'] is not NULL
+      and subsession_length>=0
+      group by 1,2
+""")
+data1a.createOrReplaceTempView("data1a")
+
+data1b=spark.sql("""
+select cid,min(date) as enrolled
+from data1a
+group by 1
+having enrolled >= '2018-01-29' and enrolled<='2018-02-12'
+""")
+data1b.createOrReplaceTempView("data1b")
+
+data1=spark.sql("""
+select 
+data1a.*, 
+data1b.enrolled,
+datediff(date, enrolled) as nd,
+floor(datediff(date, enrolled)/7) as weeksSince
+from data1a join data1b
+on data1a.cid=data1b.cid
+having nd>=0
+""")
+data1.createOrReplaceTempView("data1")
+```
+
+
+Sample 
+
+```{pydbx sample2, dependson='ex3getAllData',cache=TRUE,storein='x0',results='hide',echo=FALSE}
+spark.sql("""select * from data1 limit 30""").toPandas()
+```
+
+
+
+```{r dependson="sample2", echo=FALSE,cache=TRUE}
+kable(head(x0,7))
+```
+
+## Remove Outliers 
+
+At this stage,we remove some really unequivocal outliers, e.g. keep the top
+99.99%. I believe this would improve every hypothesis test. If you want 99.999,
+i *think* you need to pass a higher value for $B$ to `percentile_approx`(see [here](https://cwiki.apache.org/confluence/display/Hive/LanguageManual+UDF)).
+
+
+<div style='background-color:#aaaaaa;'>
+This is another parameter, the amount of outliers to remove. Either remove or
+cap these outliers to a maximum value.
+</div>
+
+
+
+```{pydbx ex4Cuts, cache=TRUE,eval=TRUE, dependson='ex3getAllData'}
+v1 = spark.sql(""" 
+   select 
+    percentile_approx(mtth, 0.9999) as mthcut, 
+    percentile_approx(mtah, 0.9999) as mahcut, 
+    percentile_approx(muri, 0.9999) as muricut
+  from  data1
+""").collect()
+v1
+```
+
+
+And finally convert to:
+
+```
+cid, branch, mret, maret, mth, mah, muri, mins
+```
+
+
+```{pydbx ex4Cutoffs, cache=TRUE,dependson=c('ex3getAllData','ex4Cuts')}
+data2 =data1.filter(data1.mtth<v1[0].mthcut).filter(data1.mtah<v1[0].mahcut).filter(data1.muri<v1[0].muricut)
+data2.createOrReplaceTempView("data2")
+finaldata  = spark.sql("""
+with b as (
+  select 
+    cid, 
+    branch, 
+    avg(mtth) as mth,
+    avg(mtah) as mah,
+    sum(muri)/( 1 / 3600 + sum(mtah) ) as muri, 
+    sum(mtah)/( 1 / 3600 + sum(mtth) ) as mins 
+  from data2
+  group by 1,2
+), 
+c as (
+  select 
+    cid, 
+    case when sum(mtth)>0 then 1 else 0 end as mret,
+    case when max(case when muri>=5 then 1 else 0 end)=1 then 1 else 0 end as maret
+  from data2
+  where weeksSince=2 
+  group by 1
+) 
+select 
+  b.cid, 
+  branch, 
+  coalesce(mret,0) as mret,
+  coalesce(maret,0) as maret,
+  coalesce(mth,0) as mth,
+  coalesce(mah,0) as mah,
+  coalesce(muri,0) as muri,
+  coalesce(mins,0) as mins
+from 
+  b left join c 
+  on b.cid = c.cid 
+""")
+finaldata.createOrReplaceTempView("finaldata") 
+
+```
+
+Save the data,
+
+```{pydbx ex4Save,dependson='ex4Cutoffs',cache=TRUE}
+finaldata.write.parquet("s3://net-mozaws-prod-us-west-2-pipeline-analysis/sguha/tmp/bsexample",mode='overwrite')
+```
+
+
+# Bootstrapping
+
+Load the data
+```{pydbx boot0, dependson='ex4Cutoffs',cache=TRUE}
+final =  spark.read.parquet("s3://net-mozaws-prod-us-west-2-pipeline-analysis/sguha/tmp/bsexample") 
+final.createOrReplaceTempView("final")
+spark.sql("""select count(*),count(distinct(cid)) from final""").collect()
+```
+
+```{pydbx boot0x, dependson='boot0',cache=TRUE,storein='x',results='hide',echo=FALSE}
+spark.sql("select * from final limit 15").toPandas()
+```
+
+```{r dependson='boot0x',echo=FALSE,cache=TRUE}
+kable(x)
+```
+
+Now that we have the data in the format we need, we will compute the following
+
+1. point estimates for the branches (e.g. mean of `mth` for different branches)bootstrap confidence intervals for the estimates
+2. confidence interval for the difference in means for the measures (which can
+   be used to determine significance) 
+3. in addition to (2), confidence intervals for the estimates of the 5,25,50,75,
+   and 95% percentiles.
+4. [stretch] shift plot of the difference in percentiles overlaid on the null distribution
+
+The number of replications will be 1000. Running a bootstrap on one computer
+might take a lot of time (in the above example, it's 1000 replications sampling
+from a million observations), we can easily (and in a 'scalable' way) translate
+this to a spark version using the Poisson Bootstrap.
+
+The [Poisson Bootstrap](https://pdfs.semanticscholar.org/4760/1669a1a5825989f7a60778b316dc6bde8472.pdf)
+will (in this case) choose 1000 independent Poisson($\lambda=1$) variables per
+observation. These values are used as weights to compute the 1000 bootstrap
+estimates. A more rigorous version (where each bootstrap sample will have ~
+0.632$n$ unique observations) is discussed
+[here](http://cyber.sci-hub.tw/MTAuMjMwNy8yNjc0MDg2/10.2307%402674086.pdf)
+which chooses $m=[0.632n]$ Zero truncated Poisson($\lambda$=1) random variables
+and $n-m$ zeros as the weights(in our example $n$ is ~ 1MM). However, this
+latter approach requires knowledge of the sample size and a novel sampler from
+the Zero Truncated Poisson distribution(see
+[here](https://en.wikipedia.org/wiki/Zero-truncated_Poisson_distribution)). 
+
+For our first approach we will stick to the simpler version, i.e. for each row,
+choose $R=1000$ independent Poisson($\lambda$=1) random variables. We are also
+aware that we don't have access to a parallel random number generator (which is
+meant to be used when using random numbers in a parallel setup) but we shall
+gloss over this fact.
+
+## Code
+
+We will convert the dataframe to an RDD and then map over the profiles and
+adding an extra $R=1000$ columns. Also we initialize the RNG at the beginning of
+the partition.
+
+### Point Estimates and Confidence Intervals
+
+Notice that `b` is initialized to `[1]`. The 0'th replicate corresponds to the
+sample estimate for the different measures and the other replicates will be the
+bootstrap replicates.
+
+
+```{pydbx boot1, cache=TRUE,eval=TRUE,dependson='boot0'}
+import os
+import binascii
+import numpy as np
+REPLICATES = 2000
+def setRandomState(seed=None):
+    #seed = (seed if seed is not None else int(binascii.hexlify(os.urandom(4)), 16))
+    rs = np.random.RandomState(None)
+    return rs
+
+def wf(it):
+    rs = setRandomState()
+    for p in it:
+        weights = rs.poisson(1,REPLICATES)
+        b = [1]
+        b.extend(weights.tolist())
+        info = {
+            'weights': b,
+            'mret': p.mret,'maret': p.maret, 'mth':p.mth,
+            'mah':p.mah, 'muri':p.muri,'mins':p.mins }
+        keys = ( p.cid,p.branch)
+        yield (keys, info)
+
+d1 = final.rdd.mapPartitions(wf)
+```
+
+An example
+
+```{pydbx sample4, dependson='boot1', eval=TRUE,cache=TRUE,echo=FALSE}
+u=d1.take(1)
+u[0][1]['weights']="["+','.join([str(x) for x in u[0][1]['weights'][:5]]  )+", ... ,]"
+u[0]
+```
+
+For each measure and branch combination we will map it to $R$ bootstrap
+estimates to create the bootstrap sample. We use the same weights for the entire
+set of measures to keep joint distributions the same.
+
+
+```{pydbx boot2, dependson='boot1',cache=TRUE}
+from pyspark.sql import Row
+def marginal(p):
+    key,v = p
+    for i,w in enumerate(v['weights']):
+        key2 = (key[1], 'marginal',i)
+        s=  ( key2,  { 'n': w,
+                       'mth': v['mth']*w,
+                       'mah': v['mah']*w,
+                       'muri': v['muri']*w,
+                       'mins': v['mins']*w,
+                       'mret': v['mret']*w,
+                       'maret': v['maret']*w
+        })
+        yield s
+
+def marginalReducer(a,b):
+    x = {}
+    if a is None and b is None:
+        x= {'n':0, 'mth':0, 'mah':0,'muri':0, 'mins':0, 'mret':0, 'maret':0}
+    else:
+      for n in ('n','mth','mah','muri','mins','mret','maret'):
+          x[n] = a.get(n,0)+b.get(n,0)
+    return x
+def marginalFinalizer(a):
+    k,v=a
+    x={}
+    for n in ('mth','mah','muri','mins','mret','maret'):
+        x[n] = v[n]/(1.0*v['n'])
+    x['mn']=v['n']
+    x['branch']=k[0]
+    x['type']='marginal'
+    x['rep']=k[2]
+    return Row(**x)
+
+pp = d1.flatMap(marginal).reduceByKey(marginalReducer).map(marginalFinalizer).toDF()
+pp=pp.select("type","branch","rep","mn","mth","mah","muri","mins","mret","maret")
+pp.createOrReplaceTempView("marginal") 
+```
+
+With only 2000 rows, we can read this into memory and produce 95% bootstrap
+confidence intervals for the individual measures. 
+
+```{pydbx sample7, dependson='boot2',cache=TRUE,storein='bs1',results='hide',echo=FALSE}
+bs1 = spark.sql("select * from marginal  ").toPandas()
+```
+
+```{r sample7a, dependson='sample7',cache=TRUE,echo=FALSE}
+kable(head(bs1,7))
+```
+
+And now compute estimates (the 0'th replicate) and 97.5% confidence intervals
+using the bootstrap percentile method. I choose the 97.5% percentile because the
+true coverage is likely less than that. Best to be conservative.
+
+```{pydbx computeEstimates, dependson='boot2',cache=TRUE,storein='x3',results='hide'}
+import pandas as pd
+marginals = []
+for p in ('mth','mah','muri','mins','mret','maret'):
+    marginals.append({
+        "column"      : p,
+        "n"           : float(bs1.loc[ bs1["rep"]==0].mn.sum()),
+        "disabledLow" : float(bs1.loc[ (bs1['branch']=="Disabled") ][p].quantile(1.25/100)),
+        "disabledMean": float(bs1.loc[ (bs1["rep"] == 0) & (bs1['branch']=="Disabled") ][p]),
+        "disabledHigh": float(bs1.loc[ (bs1['branch']=="Disabled") ][p].quantile(1-1.25/100)),
+        "enabledLow"  : float(bs1.loc[ (bs1['branch']=="Enabled") ][p].quantile(1.25/100)),
+        "enabledMean" : float(bs1.loc[ (bs1["rep"] == 0) & (bs1['branch']=="Enabled") ][p]),
+        "enabledHigh" : float(bs1.loc[ (bs1['branch']=="Enabled") ][p].quantile(1-1.25/100))
+    })
+marginals = pd.DataFrame(marginals)
+marginals = marginals[ [ "column","n","disabledLow","disabledMean","disabledHigh",
+                         "enabledLow","enabledMean","enabledHigh"]]
+marginals
+
+```
+
+
+```{r sample9, dependson='computeEstimates',cache=TRUE,echo=FALSE}
+kable(x3)
+```
+
+### Confidence Intervals for Difference in Means
+
+We will look at the bootstrap distribution of the  differences
+($\text{Measure}_\text{Enabled} - \text{Measure}_\text{Disabled}$)
+
+```{pydbx meandiff, dependson='boot2', cache=TRUE,storein='x4',cache=TRUE,results='hide'}
+def doDiff(x):
+    k,v = x
+    v = list(v)
+    disabled = [a for a  in filter(lambda x: x[0]=='Disabled', v)]
+    enabled = [a for a  in filter(lambda x: x[0]=='Enabled', v)]
+    delta = [ a-b for a,b in zip(enabled[0][1:],disabled[0][1:])]
+    return Row(**{'rep':k, 'mth': delta[0], 'mah':delta[1],'muri':delta[2],'mins':delta[3],'mret':delta[4],'maret':delta[5]})
+
+delta = pp.rdd.map(lambda a: (a.rep, ( a.branch,a.mth,a.mah,a.muri,a.mins,a.mret,a.maret))).groupByKey().map(doDiff).toDF()
+bsdiff = delta.toPandas()
+
+delta2 = []
+for p in ('mth','mah','muri','mins','mret','maret'):
+    em =  float(bs1.loc[ (bs1["rep"] == 0) & (bs1['branch']=="Enabled") ][p])
+    dm =  float(bs1.loc[ (bs1["rep"] == 0) & (bs1['branch']=="Disabled") ][p])
+    observed_delta = em-dm
+    x = {
+        'column': p ,
+        'ciLow':  float(bsdiff[p].quantile(1.25/100)),
+        'Enabled-Disabled': observed_delta,
+        'ciHigh':  float(bsdiff[p].quantile(1-1.25/100))
+    }
+    delta2.append(x)
+delta2 = pd.DataFrame(delta2)
+delta2 = delta2[ ['column','ciLow','Enabled-Disabled','ciHigh']]
+delta2
+
+```
+
+```{r sample10, dependson='meandiff',cache=TRUE,echo=FALSE}
+kable(x4)
+```
+
+### Confidence Intervals For Percentiles
+
+This is a bit trickier. Recall we compute poisson weights for the different
+observations. For a given bootstrap sample, the estimated 25% (for example)
+percentile for say `mth` would be the weighted 25% percentile of `mth` given the
+values `mth` and weights `weights` 
+
+
+```{pydbx sample11, dependson='boot1', eval=TRUE,cache=TRUE,echo=FALSE}
+u=d1.take(1)
+u[0][1]['weights']="["+','.join([str(x) for x in u[0][1]['weights'][:5]]  )+", ... ,]"
+u[0]
+```
+
+The quick solution is if a row is selected `w` times, output (using `flatMap`)
+`w` times. Which is what we do below. Once again when `rep` is zero, we have the
+sample estimate.
+```
+
+```{pydbx getPercentiles2, dependson='boot1',cache=TRUE,eval=TRUE}
+import time,sys
+def percentilew2(p):
+    key,v = p
+    for i,w in enumerate(v['weights'][:1000]): ## to make things faster
+        if w >0:
+            for p in ( 'mth','mah','muri','mins'):
+                for _ in range(w):
+                    s = Row( **{ 'branch': key[1], 'var': p, 'rep':i, 'x': v[p]})
+                    yield s
+
+time_start = time.time()
+pq2=d1.flatMap(percentilew2).toDF()
+pq2.createOrReplaceTempView("pq2")
+pq3 = spark.sql("""
+select 
+branch, 
+rep, 
+var, 
+percentile_approx(x,array(0.05,0.25,0.50,0.75,0.95)) as p
+from 
+pq2
+group by 1,2,3
+order by 1,2,3
+""")
+pq3.write.parquet("s3://net-mozaws-prod-us-west-2-pipeline-analysis/sguha/tmp/pqs",mode='overwrite')
+time_end = time.time() - time_start
+print("took {} seconds".format(str(time_end)))
+```
+
+Having saved the above data set, we 
+
+- compute the estimates for the branch and percentile combinations(5,25,50,75
+  and 95)
+- compute the upper and lower bounds using all reps not equal to 0
+
+
+```{pydbx getPercentiles2a, dependson='getPercentiles2', cache=TRUE,storein='pest',results='hide'}
+pq = spark.read.parquet("s3://net-mozaws-prod-us-west-2-pipeline-analysis/sguha/tmp/pqs")
+pq.createOrReplaceTempView("pq")
+pestimates = spark.sql("""
+with a (
+  select branch, var,
+  p[0] as p5, p[1] as p25, p[2] as p50,p[3] as p75, p[4] as p95
+  from pq where rep = 0
+),
+b as (
+select branch,var, 
+percentile_approx(p[0], 0.0125) as p5low,
+percentile_approx(p[0], 1-0.0125) as p5high,
+
+percentile_approx(p[1], 0.0125) as p25low,
+percentile_approx(p[1], 1-0.0125) as p25high,
+percentile_approx(p[2], 0.0125) as p50low,
+percentile_approx(p[2], 1-0.0125) as p50high,
+percentile_approx(p[3], 0.0125) as p75low,
+percentile_approx(p[3], 1-0.0125) as p75high,
+percentile_approx(p[4], 0.0125) as p95low,
+percentile_approx(p[4], 1-0.0125) as p95high
+from pq where rep>0
+group by 1,2
+)
+select
+a.branch,
+a.var,
+p5low,p5,p5high,
+p25low,p25,p25high,
+p50low,p50,p50high,
+p75low,p75,p75high,
+p95low,p95,p95high
+from a join  b 
+on a.branch=b.branch and a.var=b.var
+""").toPandas()
+pestimates
+```
+
+```{r sample13, dependson='getPercentiles2a', cache=TRUE, echo=FALSE}
+kable(pest[order(var, branch), c(1,2,3,4,5,6,7,8,9,10,11),with=FALSE])
+kable(pest[order(var, branch), c(1,2,12:17),with=FALSE])
+```
+
+```{r sample14, dependson='getPercentils2a',cache=TRUE,echo=FALSE}
+
+pest3=pest[,{
+    x <- .SD[order(branch),]
+    x[,data.table(
+        branch=rep(c('Disabled',"Enabled"),5),
+        p=c(5,5,25,25,50,50,75,75,95,95),
+        lo=c(p5low,p25low,p50low,p75low,p95low),
+        avg=c(p5,p25,p50,p75,p95),
+        hi=c(p5high,p25high,p50high,p75high,p95high))]
+    },by=var][order(var, p),]
+xyplot( avg ~ p|var, groups=branch, xlab='Fraction',ylab='Percentile',data=pest3,type='l',
+       scale=list(y=list(relation='free',cex=0.6)))
+
+```
+
+### The Shift  Plot
+
+
+A shift plot is a plot of the quantiles of a data set y minus those of another
+data set x against the average of both. If there was no difference, then the
+plot would look like a straight line. Departure from the straight line indicates
+the percentiles between the two groups are different. With this plot one can see
+if there is a difference in the tails (looking at the end of the curve) or if
+there is a difference in the middle of the distributions.
+
+
+The most important bits are 
+
+- the manner of sampling in `nullPerc` or `observedPerc`.
+  - the former is used for computing the shape of the shift plot when there is
+    *no* difference between Enabled and Disabled. We can compare the observed
+    curve to this to see if the observed curve supports the hypothesis that
+    Enabled is different from Disabled
+  - the latter is used to compute the confidence intervals for the observed
+    shift plot. It is like putting a confidence band around the observed shift
+    plot. if it intersects the horizontal line, we have a difference.
+
+The two methods are shown below. Importantly, `rep=0` is the observed data and
+`rep>0` are the bootstrap replicates. I have chosen 97.5 confidence since
+bootstrap percentiles often have lower coverage.
+
+#### Using bootstrap to Compute the Null Distribution of the Shift Plot
+  
+```{pydbx shift1, dependson='boot1',cache=TRUE,eval=TRUE}
+props = spark.sql(""" select branch, count(distinct(cid)) as n from final group by branch""").collect()
+propEnabled = [a for a in filter(lambda f: f.branch=='Enabled', props)][0].n*1.0 / sum([x.n for x in props])
+
+def nullPerc(it):
+    rs = setRandomState()
+    for p in it:
+        key,v = p
+        for i,w in enumerate(v['weights'][:1000]): ## to make things faster
+            if w >0:
+                for p in ( 'mth','mah','muri','mins'):
+                    for _ in range(w):
+                        if i>0:
+                            o = "Enabled" if rs.binomial(1,propEnabled)==1 else "Disabled"
+                        else:
+                            o = key[1]
+                        s = Row( **{ 'branch': o, 'var': p, 'rep':i, 'x': v[p]})
+                        yield s
+
+
+time_start = time.time()
+pqnull=d1.mapPartitions(nullPerc).toDF()
+pqnull.createOrReplaceTempView("pqnull")
+pqnull3= spark.sql("""
+select
+branch,
+rep,
+var,
+percentile_approx(x,array(0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95)) as p
+from
+pqnull
+group by 1,2,3
+order by 1,2,3
+""")
+pqnull3.write.parquet("s3://net-mozaws-prod-us-west-2-pipeline-analysis/sguha/tmp/pqs2",mode='overwrite')
+time_end = time.time() - time_start
+print("took {} seconds".format(str(time_end)))
+```
+
+Here we compute the observed pairs $(X+Y)/2,(X-Y)/2$
+
+```{pydbx shift2, dependson='shift1',cache=TRUE,eval=TRUE,results='hide', storein='pdiffest'}
+v=spark.read.parquet("s3://net-mozaws-prod-us-west-2-pipeline-analysis/sguha/tmp/pqs2")
+v.createOrReplaceTempView("v")
+
+pdiffest = spark.sql("""
+with a as (
+select 
+var,
+p[0] as p05e,p[1] as p10e,p[2] as p20e,p[3] as p30e,
+p[4] as p40e,p[5] as p50e,p[6] as p60e,p[7] as p70e,
+p[8] as p80e,p[9] as p90e,p[10] as p95e
+from v
+where rep=0 and branch='Enabled'
+),
+b as (
+select 
+var,
+p[0] as p05d,p[1] as p10d,p[2] as p20d,p[3] as p30d,
+p[4] as p40d,p[5] as p50d,p[6] as p60d,p[7] as p70d,
+p[8] as p80d,p[9] as p90d,p[10] as p95d
+from v
+where rep=0 and branch='Disabled'
+)
+select
+a.var, 
+(p05e-p05d)/2 as p05delta,(p05e+p05d)/2 as p05avg,
+(p10e-p10d)/2 as p10delta,(p10e+p10d)/2 as p10avg,
+(p20e-p20d)/2 as p20delta,(p20e+p20d)/2 as p20avg,
+(p30e-p30d)/2 as p30delta,(p30e+p30d)/2 as p30avg,
+(p40e-p40d)/2 as p40delta,(p40e+p40d)/2 as p40avg,
+(p50e-p50d)/2 as p50delta,(p50e+p50d)/2 as p50avg,
+(p60e-p60d)/2 as p60delta,(p60e+p60d)/2 as p60avg,
+(p70e-p70d)/2 as p70delta,(p70e+p70d)/2 as p70avg,
+(p80e-p80d)/2 as p80delta,(p80e+p80d)/2 as p80avg,
+(p90e-p90d)/2 as p90delta,(p90e+p90d)/2 as p90avg,
+(p95e-p95d)/2 as p95delta,(p95e+p95d)/2 as p95avg
+from a join b on a.var=b.var
+""").toPandas()
+pdiffest
+```
+
+Here we compute the bootstrap replicate pairs $(X+Y)/2,(X-Y)/2$
+and plot all the bootstrap shift plots.
+
+
+```{pydbx shift2a, dependson='shift1',cache=TRUE,eval=TRUE,results='hide',storein='pdiffboot'}        
+pdiffboot = spark.sql("""
+with a as (
+select 
+var,rep,
+p[0] as p05e,p[1] as p10e,p[2] as p20e,p[3] as p30e,
+p[4] as p40e,p[5] as p50e,p[6] as p60e,p[7] as p70e,
+p[8] as p80e,p[9] as p90e,p[10] as p95e
+from v
+where rep>0 and branch='Enabled' 
+),
+b as (
+select 
+var,rep,
+p[0] as p05d,p[1] as p10d,p[2] as p20d,p[3] as p30d,
+p[4] as p40d,p[5] as p50d,p[6] as p60d,p[7] as p70d,
+p[8] as p80d,p[9] as p90d,p[10] as p95d
+from v
+where rep>0 and branch='Disabled'
+),
+c as (select
+a.var, a.rep,
+(p05e-p05d)/2 as p05delta,(p05e+p05d)/2 as p05avg,
+(p10e-p10d)/2 as p10delta,(p10e+p10d)/2 as p10avg,
+(p20e-p20d)/2 as p20delta,(p20e+p20d)/2 as p20avg,
+(p30e-p30d)/2 as p30delta,(p30e+p30d)/2 as p30avg,
+(p40e-p40d)/2 as p40delta,(p40e+p40d)/2 as p40avg,
+(p50e-p50d)/2 as p50delta,(p50e+p50d)/2 as p50avg,
+(p60e-p60d)/2 as p60delta,(p60e+p60d)/2 as p60avg,
+(p70e-p70d)/2 as p70delta,(p70e+p70d)/2 as p70avg,
+(p80e-p80d)/2 as p80delta,(p80e+p80d)/2 as p80avg,
+(p90e-p90d)/2 as p90delta,(p90e+p90d)/2 as p90avg,
+(p95e-p95d)/2 as p95delta,(p95e+p95d)/2 as p95avg
+from a join b on a.var=b.var and a.rep=b.rep
+)
+select c.* from c
+""").toPandas()
+pdiffboot
+```
+
+
+```{r shiftplot,cache=TRUE,dependson='shift2a',echo=FALSE,fig.show='hold'}
+
+pdiffboot2 <- pdiffboot[,{
+    data.table(
+        p=c(0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95),
+        delta=c(p05delta,p10delta,p20delta,p30delta,p40delta,p50delta,p60delta,p70delta,p80delta,
+                p90delta,p95delta),
+        avg=c(p05avg,p10avg,p20avg,p30avg,p40avg,p50avg,p60avg,p70avg,p80avg,
+              p90avg,p95avg))
+},,by=list(var,rep)]
+
+pdiffest2 <- pdiffest[,
+                      data.table(
+                          p=c(0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95),
+                          delta=c(p05delta,p10delta,p20delta,p30delta,p40delta,p50delta,p60delta,p70delta,p80delta,
+                                  p90delta,p95delta),
+                          avg=c(p05avg,p10avg,p20avg,p30avg,p40avg,p50avg,p60avg,p70avg,p80avg,
+                                p90avg,p95avg))
+                     ,by=list(var)]
+
+doPlot <- function(varn){
+    a <- pdiffest2[var==varn,]
+    b <- pdiffboot2[var==varn,]
+    xyplot( delta ~ avg,groups=rep,data=b,col='#00000010',type='l',xlab='(Enabled+Disabled)/2', ylab='(Enabled-Disabled)/2',main=varn,
+           panel=function(x,y,...){
+               panel.grid()
+               panel.xyplot(x,y,...)
+               panel.xyplot(a$avg,a$delta,col='#000000',lwd=1.3,type='l')
+           },ylim=range(c(a$delta, b$delta)))
+}
+```
+
+<div class = "row">
+<div class = "col-md-6">
+```{r f1, dependson='shiftplot', echo=FALSE,cache=TRUE}
+print(doPlot('mth'))
+```
+</div>
+<div class = "col-md-6">
+```{r f2, dependson='shiftplot',  echo=FALSE,cache=TRUE}
+print(doPlot('mah'))
+```
+</div>
+</div>
+
+
+<div class = "row">
+<div class = "col-md-6">
+```{r f3, dependson='shiftplot', echo=FALSE, cache=TRUE}
+print(doPlot('muri'))
+```
+</div>
+<div class = "col-md-6">
+```{r f4, dependson='shiftplot',  echo=FALSE,cache=TRUE}
+print(doPlot('mins'))
+```
+</div>
+</div>
+
+
+
+#### Using Bootstrap to Compute the Error in the observed Shift Plot
+  
+The biggest difference is the sampling in the following code. We respect the
+classes since we do not assume the null (Enabled is same as Disabled) is true.
+ Everything proceeds the same as in the previous section.
+ 
+```{pydbx shiftobs, dependson='boot1',cache=TRUE,eval=TRUE}
+import time
+import sys
+import pandas
+def observedPerc(it):
+    rs = setRandomState()
+    for p in it:
+        key,v = p
+        for i,w in enumerate(v['weights'][:1000]): ## to make things faster
+            if w >0:
+                for p in ( 'mth','mah','muri','mins'):
+                    for _ in range(w):
+                        o = key[1]
+                        s = Row( **{ 'branch': o, 'var': p, 'rep':i, 'x': v[p]})
+                        yield s
+
+
+time_start = time.time()
+pqobs=d1.mapPartitions(observedPerc).toDF()
+pqobs.createOrReplaceTempView("pqobs")
+pqobs3= spark.sql("""
+select
+branch,
+rep,
+var,
+percentile_approx(x,array(0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95)) as p
+from
+pqobs
+group by 1,2,3
+order by 1,2,3
+""")
+pqobs3.write.parquet("s3://net-mozaws-prod-us-west-2-pipeline-analysis/sguha/tmp/pqs2obs",mode='overwrite')
+time_end = time.time() - time_start
+print("took {} seconds".format(str(time_end)))
+```
+
+
+
+```{pydbx shift2obs, dependson='shiftobs',cache=TRUE,eval=TRUE,results='hide', echo=FALSE,storein='pdiffestobs'}
+w=spark.read.parquet("s3://net-mozaws-prod-us-west-2-pipeline-analysis/sguha/tmp/pqs2obs")
+w.createOrReplaceTempView("w")
+
+pdiffestobs = spark.sql("""
+with a as (
+select 
+var,
+p[0] as p05e,p[1] as p10e,p[2] as p20e,p[3] as p30e,
+p[4] as p40e,p[5] as p50e,p[6] as p60e,p[7] as p70e,
+p[8] as p80e,p[9] as p90e,p[10] as p95e
+from w
+where rep=0 and branch='Enabled'
+),
+b as (
+select 
+var,
+p[0] as p05d,p[1] as p10d,p[2] as p20d,p[3] as p30d,
+p[4] as p40d,p[5] as p50d,p[6] as p60d,p[7] as p70d,
+p[8] as p80d,p[9] as p90d,p[10] as p95d
+from w
+where rep=0 and branch='Disabled'
+)
+select
+a.var, 
+(p05e-p05d)/2 as p05delta,(p05e+p05d)/2 as p05avg,
+(p10e-p10d)/2 as p10delta,(p10e+p10d)/2 as p10avg,
+(p20e-p20d)/2 as p20delta,(p20e+p20d)/2 as p20avg,
+(p30e-p30d)/2 as p30delta,(p30e+p30d)/2 as p30avg,
+(p40e-p40d)/2 as p40delta,(p40e+p40d)/2 as p40avg,
+(p50e-p50d)/2 as p50delta,(p50e+p50d)/2 as p50avg,
+(p60e-p60d)/2 as p60delta,(p60e+p60d)/2 as p60avg,
+(p70e-p70d)/2 as p70delta,(p70e+p70d)/2 as p70avg,
+(p80e-p80d)/2 as p80delta,(p80e+p80d)/2 as p80avg,
+(p90e-p90d)/2 as p90delta,(p90e+p90d)/2 as p90avg,
+(p95e-p95d)/2 as p95delta,(p95e+p95d)/2 as p95avg
+from a join b on a.var=b.var
+""").toPandas()
+pdiffestobs
+```
+
+
+
+```{pydbx shift2obs2, dependson='shiftobs',cache=TRUE,eval=TRUE,results='hide',echo=FALSE,storein='pdiffbootobs'}        
+pdiffbootobs = spark.sql("""  
+ with a as (
+select 
+var,rep,
+p[0] as p05e,p[1] as p10e,p[2] as p20e,p[3] as p30e,
+p[4] as p40e,p[5] as p50e,p[6] as p60e,p[7] as p70e,
+p[8] as p80e,p[9] as p90e,p[10] as p95e
+from w
+where rep>0 and branch='Enabled' 
+),
+b as (
+select 
+var,rep,
+p[0] as p05d,p[1] as p10d,p[2] as p20d,p[3] as p30d,
+p[4] as p40d,p[5] as p50d,p[6] as p60d,p[7] as p70d,
+p[8] as p80d,p[9] as p90d,p[10] as p95d
+from w
+where rep>0 and branch='Disabled'
+),
+c as (select
+a.var, a.rep,
+(p05e-p05d)/2 as p05delta,(p05e+p05d)/2 as p05avg,
+(p10e-p10d)/2 as p10delta,(p10e+p10d)/2 as p10avg,
+(p20e-p20d)/2 as p20delta,(p20e+p20d)/2 as p20avg,
+(p30e-p30d)/2 as p30delta,(p30e+p30d)/2 as p30avg,
+(p40e-p40d)/2 as p40delta,(p40e+p40d)/2 as p40avg,
+(p50e-p50d)/2 as p50delta,(p50e+p50d)/2 as p50avg,
+(p60e-p60d)/2 as p60delta,(p60e+p60d)/2 as p60avg,
+(p70e-p70d)/2 as p70delta,(p70e+p70d)/2 as p70avg,
+(p80e-p80d)/2 as p80delta,(p80e+p80d)/2 as p80avg,
+(p90e-p90d)/2 as p90delta,(p90e+p90d)/2 as p90avg,
+(p95e-p95d)/2 as p95delta,(p95e+p95d)/2 as p95avg
+from a join b on a.var=b.var and a.rep=b.rep
+)
+select c.* from c
+""").toPandas()
+pdiffbootobs
+```
+
+
+```{r shiftplot2,cache=TRUE,dependson='shift2obs',echo=FALSE,fig.show='hold'}
+ 
+  pdiffboot2obs <- pdiffbootobs[,{
+    data.table(
+        p=c(0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95),
+        delta=c(p05delta,p10delta,p20delta,p30delta,p40delta,p50delta,p60delta,p70delta,p80delta,
+                p90delta,p95delta),
+        avg=c(p05avg,p10avg,p20avg,p30avg,p40avg,p50avg,p60avg,p70avg,p80avg,
+              p90avg,p95avg))
+},,by=list(var,rep)]
+
+pdiffest2obs <- pdiffestobs[,
+                      data.table(
+                          p=c(0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95),
+                          delta=c(p05delta,p10delta,p20delta,p30delta,p40delta,p50delta,p60delta,p70delta,p80delta,
+                                  p90delta,p95delta),
+                          avg=c(p05avg,p10avg,p20avg,p30avg,p40avg,p50avg,p60avg,p70avg,p80avg,
+                                p90avg,p95avg))
+                     ,by=list(var)]
+
+doPlot <- function(varn){
+    a <- pdiffest2obs[var==varn,]
+     b <- pdiffboot2obs[var==varn,]
+    xyplot( delta ~ avg,groups=rep,data=b,col='#00000010',span=0.5,type='smooth',xlab='(Enabled+Disabled)/2', ylab='(Enabled-Disabled)/2',main=varn,
+           panel=function(x,y,...){
+               panel.grid()
+               panel.xyplot(x,y,...)
+               panel.loess(a$avg,a$delta,col='#ff0000',lwd=1.3,span=0.5,type='l')
+           },ylim=range(c(a$delta, b$delta)))
+}
+```
+
+<div class = "row">
+<div class = "col-md-6">
+```{r f1x, dependson='shiftplot2', echo=FALSE,cache=TRUE}
+ print(doPlot('mth'))
+```
+</div>
+<div class = "col-md-6">
+```{r f2x, dependson='shiftplot2',  echo=FALSE,cache=TRUE}
+ print(doPlot('mah'))
+```
+</div>
+</div>
+
+
+<div class = "row">
+<div class = "col-md-6">
+```{r f3x, dependson='shiftplot2', echo=FALSE, cache=TRUE}
+ print(doPlot('muri'))
+```
+</div>
+<div class = "col-md-6">
+```{r f4x, dependson='shiftplot2',  echo=FALSE,cache=TRUE}
+ print(doPlot('mins'))
+```
+</div>
+</div>
+
+
